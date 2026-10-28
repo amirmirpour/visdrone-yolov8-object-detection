@@ -1,0 +1,133 @@
+
+======================================================================
+generate_regions
+======================================================================
+
+def generate_regions(width, height, crop_size=480, stride=360):
+    """Generate candidate crops while including image boundaries."""
+    if width < crop_size or height < crop_size:
+        raise ValueError(
+            f"Image dimensions {width}x{height} are smaller than crop size {crop_size}."
+        )
+
+    def positions(length):
+        values = list(range(0, max(1, length - crop_size + 1), stride))
+        final_position = length - crop_size
+
+        if not values or values[-1] != final_position:
+            values.append(final_position)
+
+        return sorted(set(values))
+
+    xs = positions(width)
+    ys = positions(height)
+
+    return [
+        (x, y, x + crop_size, y + crop_size)
+        for y in ys
+        for x in xs
+    ]
+
+
+======================================================================
+predictions_from_result
+======================================================================
+
+def predictions_from_result(result, offset_x=0, offset_y=0):
+    """Convert an Ultralytics result to dictionaries in original-image coordinates."""
+    predictions = []
+
+    if result.boxes is None:
+        return predictions
+
+    boxes = result.boxes.xyxy.cpu().numpy()
+    classes = result.boxes.cls.cpu().numpy().astype(int)
+    confidences = result.boxes.conf.cpu().numpy()
+
+    for box, cls, conf in zip(boxes, classes, confidences):
+        shifted_box = np.array(box, dtype=float)
+        shifted_box[[0, 2]] += offset_x
+        shifted_box[[1, 3]] += offset_y
+
+        predictions.append({
+            "box": shifted_box,
+            "cls": int(cls),
+            "conf": float(conf)
+        })
+
+    return predictions
+
+
+======================================================================
+select_top_regions
+======================================================================
+
+def select_top_regions(regions, baseline_predictions, width, height):
+    """Rank regions using baseline predictions only."""
+    scored_regions = []
+
+    for region_index, (x1, y1, x2, y2) in enumerate(regions):
+        detections = []
+
+        for pred in baseline_predictions:
+            box = pred["box"]
+            center_x = (box[0] + box[2]) / 2
+            center_y = (box[1] + box[3]) / 2
+
+            if x1 <= center_x < x2 and y1 <= center_y < y2:
+                detections.append(pred)
+
+        small_count = 0
+        uncertain_count = 0
+
+        for pred in detections:
+            box = pred["box"]
+            area_percent = (
+                max(0, box[2] - box[0])
+                * max(0, box[3] - box[1])
+                / (width * height)
+                * 100
+            )
+
+            if area_percent <= SMALL_AREA_PERCENT:
+                small_count += 1
+
+            if pred["conf"] < 0.25:
+                uncertain_count += 1
+
+        score = (
+            2.0 * small_count
+            + 1.5 * uncertain_count
+            + 0.25 * len(detections)
+        )
+
+        scored_regions.append({
+            "region": region_index,
+            "coords": (x1, y1, x2, y2),
+            "score": score
+        })
+
+    # Prefer high-scoring regions and avoid selecting nearly identical regions.
+    scored_regions.sort(key=lambda item: item["score"], reverse=True)
+    selected = []
+
+    for candidate in scored_regions:
+        if len(selected) >= REGIONS_PER_IMAGE:
+            break
+
+        overlaps_too_much = False
+
+        for chosen in selected:
+            iou = box_iou_one_to_many(
+                candidate["coords"],
+                [chosen["coords"]]
+            )[0]
+
+            if iou > 0.50:
+                overlaps_too_much = True
+                break
+
+        if not overlaps_too_much:
+            selected.append(candidate)
+
+    return selected
